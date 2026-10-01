@@ -13,6 +13,7 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 
@@ -99,6 +100,14 @@ class RouterConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(title="Satellite Router", data={}, subentries=found)
 
 
+def _satellite_title(hass: HomeAssistant, sat: er.RegistryEntry) -> str:
+    """The satellite's device name ("Office Voice"); the entity itself is usually unnamed."""
+    if sat.device_id and (device := dr.async_get(hass).async_get(sat.device_id)):
+        if name := device.name_by_user or device.name:
+            return name
+    return sat.name or sat.original_name or sat.entity_id
+
+
 def _schema(hass: HomeAssistant) -> vol.Schema:
     return vol.Schema(
         {
@@ -148,7 +157,7 @@ class SatelliteSubentryFlow(ConfigSubentryFlow):
                 for key in (CONF_STT_SCRIPT, CONF_TTS_SCRIPT):
                     if user_input.get(key):
                         data[key] = user_input[key]
-                title = sat.name or sat.original_name or sat.entity_id
+                title = _satellite_title(self.hass, sat)
                 if step_id == "reconfigure":
                     return self.async_update_and_abort(
                         self._get_entry(),
