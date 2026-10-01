@@ -200,3 +200,42 @@ async def test_incompatible_esphome(hass: HomeAssistant, calls) -> None:
         await _setup(hass, _entry())
         assert EsphomeAssistSatellite.__dict__["on_pipeline_event"] is on_pipeline_event
     assert ir.async_get(hass).async_get_issue(DOMAIN, "incompatible_esphome")
+
+
+async def test_tts_speak_fallback_with_listening_script(hass: HomeAssistant, calls) -> None:
+    """The listening script's volume isn't passed to tts.speak, which would reject it."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry(tts_script=None))
+    sat = make_satellite(hass, ROUTED)
+    _run(sat, *CONVERSATION)
+    await hass.async_block_till_done()
+    assert calls[1] == (
+        "tts.speak",
+        {
+            "entity_id": "tts.piper",
+            "message": "It is noon.",
+            "media_player_entity_id": ["media_player.office_sonos"],
+            "language": "en_US",
+            "options": {"voice": "amy"},
+        },
+    )
+
+
+async def test_response_script_without_media_players(hass: HomeAssistant, calls) -> None:
+    """A response script alone still gets the response (the satellite is silenced)."""
+    await _setup(hass, _entry(media_players=[], stt_script=None))
+    sat = make_satellite(hass, ROUTED)
+    _run(sat, *CONVERSATION)
+    await hass.async_block_till_done()
+    assert calls == [
+        (
+            "script.tts_speak",
+            {
+                "entity_id": "tts.piper",
+                "message": "It is noon.",
+                "language": "en_US",
+                "options": {"voice": "amy"},
+            },
+        ),
+    ]
+    assert ("VOICE_ASSISTANT_TTS_END", {}) in sent(sat)

@@ -28,6 +28,7 @@ from homeassistant.core import HomeAssistant, callback
 _LOGGER = logging.getLogger(__name__)
 
 _MARK = "__satellite_router_original__"
+_TTS_SPEAK_FIELDS = ("entity_id", "message", "media_player_entity_id", "language", "options")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,15 +78,13 @@ class Router:
                 return replace(event, data={**data, "tts_start_streaming": False})
 
         elif event.type is PipelineEventType.TTS_START:
-            if route.media_players:
+            # The core patch only collected this with media players set, so a
+            # response script alone silenced the satellite and played nothing.
+            if route.external_output:
                 pending = self._pending.setdefault(registry_id, {})
-                pending.update(
-                    {
-                        "entity_id": data.get("engine"),
-                        "message": data.get("tts_input"),
-                        "media_player_entity_id": list(route.media_players),
-                    }
-                )
+                pending.update({"entity_id": data.get("engine"), "message": data.get("tts_input")})
+                if route.media_players:
+                    pending["media_player_entity_id"] = list(route.media_players)
                 if data.get("language"):
                     pending["language"] = data["language"]
                 if data.get("voice"):
@@ -110,11 +109,14 @@ class Router:
         pending = self._pending.get(registry_id)
         if not pending:
             return
-        action = route.tts_script or ("tts.speak" if pending.get("message") else None)
-        if action is None:
-            return
-        del self._pending[registry_id]
-        self._run(action, pending)
+        if route.tts_script:
+            del self._pending[registry_id]
+            self._run(route.tts_script, pending)
+        elif pending.get("message") and pending.get("media_player_entity_id"):
+            del self._pending[registry_id]
+            # tts.speak rejects anything else (the patch also passed the
+            # listening script's volume, which broke this fallback).
+            self._run("tts.speak", {k: v for k, v in pending.items() if k in _TTS_SPEAK_FIELDS})
 
 
 def satellite_class() -> type:
