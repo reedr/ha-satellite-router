@@ -1,0 +1,70 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Route ESPHome voice satellites' responses to other media players. Satellites are added as entries under the integration.\n\nRoutes found in patched ESPHome options to import: {count} ({titles})."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Satellite Router is already set up; add satellites to it."
+    }
+  },
+  "config_subentries": {
+    "satellite": {
+      "entry_type": "Satellite",
+      "initiate_flow": {
+        "user": "Add satellite",
+        "reconfigure": "Change satellite"
+      },
+      "step": {
+        "user": {
+          "title": "Route a satellite",
+          "data": {
+            "satellite": "Satellite",
+            "media_players": "Media players",
+            "stt_script": "Listening script",
+            "tts_script": "Response script"
+          },
+          "data_description": {
+            "satellite": "An ESPHome voice satellite.",
+            "media_players": "Where responses play. The first one's volume is passed to the listening script.",
+            "stt_script": "Runs when the satellite starts listening, with media_player_entity_id and media_player_volume_level (e.g. to duck the speakers).",
+            "tts_script": "Plays the response, with entity_id (TTS engine), message, language, options and the fields above. Without it, tts.speak plays the message on the media players."
+          }
+        },
+        "reconfigure": {
+          "title": "Change a satellite's route",
+          "data": {
+            "satellite": "Satellite",
+            "media_players": "Media players",
+            "stt_script": "Listening script",
+            "tts_script": "Response script"
+          },
+          "data_description": {
+            "satellite": "An ESPHome voice satellite.",
+            "media_players": "Where responses play. The first one's volume is passed to the listening script.",
+            "stt_script": "Runs when the satellite starts listening.",
+            "tts_script": "Plays the response. Without it, tts.speak plays the message on the media players."
+          }
+        }
+      },
+      "error": {
+        "unknown_satellite": "That satellite isn't in the entity registry."
+      },
+      "abort": {
+        "already_configured": "That satellite already has a route.",
+        "reconfigure_successful": "The route was updated."
+      }
+    }
+  },
+  "issues": {
+    "incompatible_esphome": {
+      "title": "Satellite Router can't hook ESPHome",
+      "description": "This version of the ESPHome integration changed in a way Satellite Router doesn't support ({reason}). Satellites behave normally (responses play on the satellites) until Satellite Router is updated."
+    },
+    "patched_core": {
+      "title": "ESPHome is patched to route satellites",
+      "description": "This Home Assistant's ESPHome integration has the satellite TTS/STT script options patched in. Satellite Router is inactive so responses aren't routed twice. Remove the patch (or this integration)."
+    }
+  }
+}

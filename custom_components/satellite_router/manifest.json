@@ -1,0 +1,14 @@
+{
+  "domain": "satellite_router",
+  "name": "Satellite Router",
+  "codeowners": ["@reedr"],
+  "config_flow": true,
+  "dependencies": ["assist_pipeline", "esphome"],
+  "documentation": "https://github.com/reedr/ha-satellite-router",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/reedr/ha-satellite-router/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "1.0.0"
+}

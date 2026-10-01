@@ -1,0 +1,13 @@
+pytest-homeassistant-custom-component==0.13.366
+aioesphomeapi==46.2.0
+esphome-dashboard-api==1.4.0
+bleak-esphome==4.0.0
+hassil==3.12.0
+home-assistant-intents==2026.8.28
+mutagen==1.48.1
+pymicro-vad==1.0.1
+pyspeex-noise==1.0.2
+gazetteer-matcher==1.1.0
+aiousbwatcher==1.1.2
+serialx==1.10.0
+ha-ffmpeg
