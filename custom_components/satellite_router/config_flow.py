@@ -102,9 +102,9 @@ class RouterConfigFlow(ConfigFlow, domain=DOMAIN):
 
 def _satellite_title(hass: HomeAssistant, sat: er.RegistryEntry) -> str:
     """The satellite's device name ("Office Voice"); the entity itself is usually unnamed."""
-    if sat.device_id and (device := dr.async_get(hass).async_get(sat.device_id)):
-        if name := device.name_by_user or device.name:
-            return name
+    device = dr.async_get(hass).async_get(sat.device_id) if sat.device_id else None
+    if device and (name := device.name_by_user or device.name):
+        return name
     return sat.name or sat.original_name or sat.entity_id
 
 
