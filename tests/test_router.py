@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
+from homeassistant.components.assist_satellite import AssistSatelliteAnnouncement
 from homeassistant.components.esphome.assist_satellite import EsphomeAssistSatellite
 from homeassistant.config_entries import ConfigSubentryData
 from homeassistant.core import HomeAssistant
@@ -23,6 +25,10 @@ TTS_OUTPUT = {
     "mime_type": "audio/flac",
 }
 ORIGINAL = EsphomeAssistSatellite.__dict__["on_pipeline_event"]
+ORIGINAL_START = EsphomeAssistSatellite.__dict__["async_start_conversation"]
+ORIGINAL_ANNOUNCE = EsphomeAssistSatellite.__dict__["async_announce"]
+CHIME = "http://ha.local:8123/api/assist_satellite/static/preannounce.mp3"
+PIPELINE = SimpleNamespace(tts_engine="tts.piper", tts_language="en_US", tts_voice="amy")
 
 
 def _entry(**route) -> MockConfigEntry:
@@ -284,3 +290,179 @@ async def test_finish_error_never_breaks_satellite(hass: HomeAssistant, calls) -
     sat.tts_response_finished = MagicMock(side_effect=RuntimeError("boom"))
     _run(sat, *CONVERSATION)  # must not raise
     assert ("VOICE_ASSISTANT_RUN_END", {}) in sent(sat)
+
+
+def _announcement(message: str = "Want the porch light on?", **kw) -> AssistSatelliteAnnouncement:
+    return AssistSatelliteAnnouncement(
+        message=message,
+        media_id=kw.pop("media_id", "http://ha.local:8123/api/tts_proxy/q.flac"),
+        original_media_id="media-source://tts/x",
+        tts_token="q.flac",
+        media_id_source=kw.pop("media_id_source", "tts"),
+        preannounce_media_id=kw.pop("preannounce_media_id", CHIME),
+    )
+
+
+def _speaking_satellite(hass: HomeAssistant, registry_id: str = ROUTED):
+    sat = make_satellite(hass, registry_id)
+    sat.cli.send_voice_assistant_announcement_await_response = AsyncMock()
+    sat._resolve_pipeline = MagicMock(return_value=None)
+    return sat
+
+
+def _device_announcements(sat) -> list[tuple[str, str, bool, str]]:
+    """(media_id, text, start_conversation, preannounce) the device was asked to play."""
+    return [
+        (c.args[0], c.args[2], c.kwargs["start_conversation"], c.kwargs["preannounce_media_id"])
+        for c in sat.cli.send_voice_assistant_announcement_await_response.call_args_list
+    ]
+
+
+SPOKEN_QUESTION = {
+    "media_player_entity_id": ["media_player.office_sonos"],
+    "media_player_volume_level": 0.3,
+    "message": "Want the porch light on?",
+    "entity_id": "tts.piper",
+    "language": "en_US",
+    "options": {"voice": "amy"},
+}
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_speaks_on_media_players(_, hass: HomeAssistant, calls) -> None:
+    """The opening message plays on the Sonos; the satellite plays the chime, then listens."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    await sat.async_start_conversation(_announcement())
+    assert calls == [("script.tts_speak", SPOKEN_QUESTION)]
+    assert _device_announcements(sat) == [(CHIME, "Want the porch light on?", True, "")]
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_without_preannounce_still_cues(_, hass, calls) -> None:
+    """The device only listens after playing something, so the chime is used anyway."""
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    await sat.async_start_conversation(_announcement(preannounce_media_id=None))
+    assert _device_announcements(sat) == [(CHIME, "Want the porch light on?", True, "")]
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_unrouted(_, hass: HomeAssistant, calls) -> None:
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass, "reg-other")
+    await sat.async_start_conversation(_announcement())
+    assert calls == []
+    assert _device_announcements(sat) == [
+        ("http://ha.local:8123/api/tts_proxy/q.flac", "Want the porch light on?", True, CHIME)
+    ]
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_falls_back_when_playback_fails(_, hass, calls) -> None:
+    """If the media players can't play it, the satellite asks the question itself."""
+    hass.services.async_remove("script", "tts_speak")
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    await sat.async_start_conversation(_announcement())
+    assert _device_announcements(sat) == [
+        ("http://ha.local:8123/api/tts_proxy/q.flac", "Want the porch light on?", True, CHIME)
+    ]
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_announcements_stay_on_satellite_by_default(_, hass, calls) -> None:
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    await sat.async_announce(_announcement("Dinner is ready."))
+    assert calls == []
+    assert _device_announcements(sat) == [
+        ("http://ha.local:8123/api/tts_proxy/q.flac", "Dinner is ready.", False, CHIME)
+    ]
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_announcements_routed_when_enabled(_, hass: HomeAssistant, calls) -> None:
+    await _setup(hass, _entry(announcements=True, stt_script=None, tts_script=None))
+    sat = _speaking_satellite(hass)
+    await sat.async_announce(_announcement("Dinner is ready."))
+    assert calls == [
+        (
+            "tts.speak",
+            {
+                "message": "Dinner is ready.",
+                "entity_id": "tts.piper",
+                "language": "en_US",
+                "options": {"voice": "amy"},
+                "media_player_entity_id": ["media_player.office_sonos"],
+            },
+        )
+    ]
+    assert _device_announcements(sat) == []
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_media_announcements_stay_on_satellite(_, hass: HomeAssistant, calls) -> None:
+    """A sound or URL (no spoken message to re-synthesize) plays on the satellite."""
+    await _setup(hass, _entry(announcements=True))
+    sat = _speaking_satellite(hass)
+    await sat.async_announce(
+        _announcement("", media_id="http://x/doorbell.mp3", media_id_source="url")
+    )
+    assert calls == []
+    assert _device_announcements(sat) == [("http://x/doorbell.mp3", "", False, CHIME)]
+
+
+def _intent_end(follow_up: bool) -> tuple[PipelineEventType, dict]:
+    return (
+        PipelineEventType.INTENT_END,
+        {
+            "intent_output": {
+                "conversation_id": "c1",
+                "continue_conversation": follow_up,
+                "response": {"speech": {"plain": {"speech": "It is noon."}}},
+            }
+        },
+    )
+
+
+async def test_follow_up_reopens_microphone_after_response(hass: HomeAssistant, calls) -> None:
+    """A response that asks something plays on the Sonos, then the satellite listens again."""
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    order: list[str] = []
+    sat.cli.send_voice_assistant_announcement_await_response.side_effect = (
+        lambda *a, **k: order.append(f"listen {len(calls)} played")
+    )
+    _run(sat, *CONVERSATION[:4], _intent_end(True), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    assert [c[0] for c in calls] == ["script.stt_listen", "script.tts_speak"]
+    assert _device_announcements(sat) == [(CHIME, "", True, "")]
+    assert order == ["listen 2 played"]  # only once the response finished playing
+
+
+async def test_no_follow_up_without_continue(hass: HomeAssistant, calls) -> None:
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    _run(sat, *CONVERSATION[:4], _intent_end(False), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    assert _device_announcements(sat) == []
+
+
+async def test_follow_up_skipped_when_playback_fails(hass: HomeAssistant, calls) -> None:
+    hass.services.async_remove("script", "tts_speak")
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    _run(sat, *CONVERSATION[:4], _intent_end(True), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    assert _device_announcements(sat) == []
+
+
+async def test_unload_restores_announcement_methods(hass: HomeAssistant, calls) -> None:
+    entry = _entry()
+    await _setup(hass, entry)
+    assert EsphomeAssistSatellite.__dict__["async_start_conversation"] is not ORIGINAL_START
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert EsphomeAssistSatellite.__dict__["async_start_conversation"] is ORIGINAL_START
+    assert EsphomeAssistSatellite.__dict__["async_announce"] is ORIGINAL_ANNOUNCE

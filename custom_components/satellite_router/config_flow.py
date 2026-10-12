@@ -18,6 +18,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_ANNOUNCEMENTS,
     CONF_MEDIA_PLAYERS,
     CONF_SATELLITE,
     CONF_STT_SCRIPT,
@@ -123,6 +124,7 @@ def _schema(hass: HomeAssistant) -> vol.Schema:
             vol.Optional(CONF_TTS_SCRIPT): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="script")
             ),
+            vol.Optional(CONF_ANNOUNCEMENTS, default=False): selector.BooleanSelector(),
         }
     )
 
@@ -153,6 +155,7 @@ class SatelliteSubentryFlow(ConfigSubentryFlow):
                 data = {
                     CONF_SATELLITE: sat.id,
                     CONF_MEDIA_PLAYERS: user_input.get(CONF_MEDIA_PLAYERS) or [],
+                    CONF_ANNOUNCEMENTS: bool(user_input.get(CONF_ANNOUNCEMENTS)),
                 }
                 for key in (CONF_STT_SCRIPT, CONF_TTS_SCRIPT):
                     if user_input.get(key):

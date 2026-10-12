@@ -19,23 +19,43 @@ playing the response. A silenced device never plays it, so it never reports,
 and the entity would sit in ``responding`` until its next run. For runs whose
 audio was removed, the hook calls ``tts_response_finished()`` itself once
 RUN_END has been handled.
+
+Conversations need the device to play something, too: it only reopens its
+microphone (for ``continue_conversation`` or ``start_conversation``) after it
+finishes playing audio. So for those the response is played on the media
+players and awaited, and then the satellite is sent a short cue (the
+pre-announcement chime) as an announcement that starts a conversation. This
+wraps ESPHome's ``async_start_conversation`` (and ``async_announce``, for
+routes that route announcements) the same way.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
 from typing import Any
 
-from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
+from homeassistant.components.assist_pipeline import (
+    PipelineEvent,
+    PipelineEventType,
+    async_get_pipeline,
+)
+from homeassistant.components.assist_satellite import (
+    AssistSatelliteAnnouncement,
+    AssistSatelliteEntity,
+)
+from homeassistant.components.assist_satellite.const import PREANNOUNCE_URL
+from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
 
 _MARK = "__satellite_router_original__"
 _TTS_SPEAK_FIELDS = ("entity_id", "message", "media_player_entity_id", "language", "options")
+_ANNOUNCE_METHODS = ("async_announce", "async_start_conversation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +65,7 @@ class Route:
     media_players: tuple[str, ...]
     stt_script: str | None
     tts_script: str | None
+    announcements: bool = False
 
     @property
     def external_output(self) -> bool:
@@ -55,16 +76,32 @@ class Route:
 class Router:
     """Holds the routes and each satellite's response in progress."""
 
-    def __init__(self, hass: HomeAssistant, run: Callable[[str, dict[str, Any]], None]) -> None:
-        """Set up; ``run(action, data)`` calls an action without waiting for it."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        run: Callable[[str, dict[str, Any]], None],
+        call: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+        spawn: Callable[[Coroutine[Any, Any, None], str], None] | None = None,
+    ) -> None:
+        """Set up.
+
+        ``run(action, data)`` calls an action without waiting for it,
+        ``call(action, data)`` calls one and waits until it has finished, and
+        ``spawn(coro, name)`` runs a coroutine in the background.
+        """
         self.hass = hass
         self._run = run
+        self._call = call
+        self._spawn = spawn
         self.routes: dict[str, Route] = {}  # by entity registry ID
         self._pending: dict[str, dict[str, Any]] = {}
         self._silenced: set[str] = set()  # runs whose response audio was removed
+        self._follow_up: dict[str, Any] = {}  # satellites to reopen after the response
 
     @callback
-    def process(self, registry_id: str | None, event: PipelineEvent) -> PipelineEvent:
+    def process(
+        self, registry_id: str | None, event: PipelineEvent, satellite: Any = None
+    ) -> PipelineEvent:
         """Act on an event for a satellite; return the event ESPHome should see."""
         route = self.routes.get(registry_id) if registry_id else None
         if route is None:
@@ -84,6 +121,17 @@ class Router:
             if route.external_output and data.get("tts_start_streaming"):
                 # The satellite won't play the response, so it needn't prepare to stream it.
                 return replace(event, data={**data, "tts_start_streaming": False})
+
+        elif event.type is PipelineEventType.INTENT_END:
+            output = data.get("intent_output") or {}
+            if (
+                route.external_output
+                and output.get("continue_conversation")
+                and satellite is not None
+                and self._call is not None
+                and self._spawn is not None
+            ):
+                self._follow_up[registry_id] = satellite
 
         elif event.type is PipelineEventType.TTS_START:
             # The core patch only collected this with media players set, so a
@@ -105,11 +153,13 @@ class Router:
                 return replace(event, data={**data, "tts_output": None})
 
         elif event.type is PipelineEventType.RUN_START:
+            self._follow_up.pop(registry_id, None)
             if route.external_output and data.get("tts_output"):
                 return replace(event, data={k: v for k, v in data.items() if k != "tts_output"})
 
         elif event.type is PipelineEventType.RUN_END:
             self._speak(registry_id, route)
+            self._follow_up.pop(registry_id, None)
 
         return event
 
@@ -124,16 +174,101 @@ class Router:
     def _speak(self, registry_id: str, route: Route) -> None:
         """Hand a collected response to the TTS script, or to tts.speak."""
         pending = self._pending.get(registry_id)
-        if not pending:
+        if not pending or (request := _request(route, pending)) is None:
             return
-        if route.tts_script:
-            del self._pending[registry_id]
-            self._run(route.tts_script, pending)
-        elif pending.get("message") and pending.get("media_player_entity_id"):
-            del self._pending[registry_id]
-            # tts.speak rejects anything else (the patch also passed the
-            # listening script's volume, which broke this fallback).
-            self._run("tts.speak", {k: v for k, v in pending.items() if k in _TTS_SPEAK_FIELDS})
+        del self._pending[registry_id]
+        if (satellite := self._follow_up.pop(registry_id, None)) is not None:
+            assert self._spawn is not None
+            self._spawn(self._speak_then_listen(satellite, *request), "satellite_router follow-up")
+        else:
+            self._run(*request)
+
+    async def _speak_then_listen(self, satellite: Any, action: str, data: dict[str, Any]) -> None:
+        """Play a response that asks something, then reopen the satellite's microphone."""
+        assert self._call is not None
+        try:
+            await self._call(action, data)
+        except Exception:
+            _LOGGER.exception("Satellite Router couldn't play the response; not listening again")
+            return
+        try:
+            # The cue isn't a TTS announcement, so the wrapped method passes it straight on.
+            await satellite.async_start_conversation(_cue(self.hass, None, ""))
+        except Exception:
+            _LOGGER.exception("Satellite Router couldn't reopen the satellite's microphone")
+
+    async def announce(
+        self,
+        satellite: Any,
+        registry_id: str | None,
+        announcement: AssistSatelliteAnnouncement,
+        conversation: bool,
+    ) -> AssistSatelliteAnnouncement | None:
+        """Play an announcement on the media players.
+
+        Returns what the satellite should still be sent: the announcement
+        unchanged when it isn't routed, the listening cue for a conversation,
+        or None when nothing is left for the satellite to do.
+        """
+        route = self.routes.get(registry_id) if registry_id else None
+        if (
+            route is None
+            or self._call is None
+            or not route.external_output
+            or not (conversation or route.announcements)
+            # Media other than a spoken message (a sound, a URL) stays on the satellite.
+            or announcement.media_id_source != "tts"
+            or not announcement.message
+        ):
+            return announcement
+        pending: dict[str, Any] = {"message": announcement.message}
+        pipeline = async_get_pipeline(self.hass, satellite._resolve_pipeline())
+        pending["entity_id"] = pipeline.tts_engine
+        if pipeline.tts_language:
+            pending["language"] = pipeline.tts_language
+        if pipeline.tts_voice:
+            pending["options"] = {"voice": pipeline.tts_voice}
+        if route.media_players:
+            pending["media_player_entity_id"] = list(route.media_players)
+            if player := self.hass.states.get(route.media_players[0]):
+                pending["media_player_volume_level"] = player.attributes.get("volume_level")
+        if (request := _request(route, pending)) is None:
+            return announcement
+        try:
+            await self._call(*request)
+        except Exception:
+            _LOGGER.exception("Satellite Router couldn't play the announcement; the satellite will")
+            return announcement
+        if not conversation:
+            return None
+        return _cue(self.hass, announcement.preannounce_media_id, announcement.message)
+
+
+def _request(route: Route, pending: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """The action that plays a response, and its data."""
+    if route.tts_script:
+        return route.tts_script, pending
+    if pending.get("message") and pending.get("media_player_entity_id"):
+        # tts.speak rejects anything else (the patch also passed the
+        # listening script's volume, which broke this fallback).
+        return "tts.speak", {k: v for k, v in pending.items() if k in _TTS_SPEAK_FIELDS}
+    return None
+
+
+def _cue(hass: HomeAssistant, media_id: str | None, message: str) -> AssistSatelliteAnnouncement:
+    """A short sound for the satellite to play before it starts listening.
+
+    The device only opens its microphone for a conversation after playing an
+    announcement, so one is needed even when the speech played elsewhere.
+    """
+    url = media_id or async_process_play_media_url(hass, PREANNOUNCE_URL)
+    return AssistSatelliteAnnouncement(
+        message=message,
+        media_id=url,
+        original_media_id=url,
+        tts_token=None,
+        media_id_source="url",
+    )
 
 
 def satellite_class() -> type:
@@ -145,31 +280,51 @@ def satellite_class() -> type:
     return EsphomeAssistSatellite
 
 
+def _params(cls: type, name: str) -> list[str] | None:
+    method = cls.__dict__.get(name)
+    if method is None:
+        return None
+    return list(inspect.signature(getattr(method, _MARK, method)).parameters)
+
+
 def check_compatible(cls: type) -> str | None:
     """Why the hook can't be installed on this ESPHome version, or None."""
-    method = cls.__dict__.get("on_pipeline_event")
-    if method is None:
+    params = _params(cls, "on_pipeline_event")
+    if params is None:
         return "EsphomeAssistSatellite.on_pipeline_event is missing"
-    original = getattr(method, _MARK, method)
-    if list(inspect.signature(original).parameters) != ["self", "event"]:
-        return f"on_pipeline_event{inspect.signature(original)} has changed"
+    if params != ["self", "event"]:
+        original = cls.__dict__["on_pipeline_event"]
+        return f"on_pipeline_event{inspect.signature(getattr(original, _MARK, original))} has changed"
     return None
 
 
 def install(cls: type, get_router: Callable[[], Router | None]) -> None:
-    """Wrap ``cls.on_pipeline_event`` (once)."""
+    """Wrap ``cls.on_pipeline_event`` and the announcement methods (once)."""
     current = cls.__dict__["on_pipeline_event"]
-    if hasattr(current, _MARK):
-        return
-    original = current
+    if not hasattr(current, _MARK):
+        _install_events(cls, current, get_router)
+    for name in _ANNOUNCE_METHODS:
+        method = cls.__dict__.get(name)
+        if method is None or hasattr(method, _MARK):
+            continue
+        # ESPHome's decorator hides the signature; core calls the base class's contract.
+        params = _params(AssistSatelliteEntity, name)
+        if params is None or len(params) != 2:
+            _LOGGER.warning("ESPHome's %s has changed; announcements aren't routed", name)
+            continue
+        _install_announce(cls, name, method, get_router)
 
+
+def _install_events(
+    cls: type, original: Callable[..., Any], get_router: Callable[[], Router | None]
+) -> None:
     def on_pipeline_event(self: Any, event: PipelineEvent) -> None:
         router = get_router()
         entry = getattr(self, "registry_entry", None)
         registry_id = entry.id if entry else None
         if router is not None:
             try:
-                event = router.process(registry_id, event)
+                event = router.process(registry_id, event, self)
             except Exception:
                 _LOGGER.exception("Satellite Router failed on %s", event.type)
         original(self, event)
@@ -187,8 +342,37 @@ def install(cls: type, get_router: Callable[[], Router | None]) -> None:
     cls.on_pipeline_event = on_pipeline_event
 
 
+def _install_announce(
+    cls: type, name: str, original: Callable[..., Any], get_router: Callable[[], Router | None]
+) -> None:
+    conversation = name == "async_start_conversation"
+
+    async def wrapper(self: Any, announcement: AssistSatelliteAnnouncement) -> None:
+        router = get_router()
+        if router is not None:
+            entry = getattr(self, "registry_entry", None)
+            try:
+                result = await router.announce(
+                    self, entry.id if entry else None, announcement, conversation
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Satellite Router failed on %s", name)
+                result = announcement
+            if result is None:
+                return
+            announcement = result
+        await original(self, announcement)
+
+    setattr(wrapper, _MARK, original)
+    wrapper.__doc__ = original.__doc__
+    setattr(cls, name, wrapper)
+
+
 def uninstall(cls: type) -> None:
-    """Restore ESPHome's own method."""
-    current = cls.__dict__.get("on_pipeline_event")
-    if current is not None and hasattr(current, _MARK):
-        cls.on_pipeline_event = getattr(current, _MARK)
+    """Restore ESPHome's own methods."""
+    for name in ("on_pipeline_event", *_ANNOUNCE_METHODS):
+        current = cls.__dict__.get(name)
+        if current is not None and hasattr(current, _MARK):
+            setattr(cls, name, getattr(current, _MARK))

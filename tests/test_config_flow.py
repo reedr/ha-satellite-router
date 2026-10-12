@@ -76,6 +76,7 @@ async def test_add_and_change_satellite(hass: HomeAssistant) -> None:
         "satellite": sat.id,
         "media_players": ["media_player.kitchen_sonos"],
         "tts_script": "script.tts_speak",
+        "announcements": False,
     }
     runtime = entry.runtime_data
     assert runtime.routes[sat.id].tts_script == "script.tts_speak"
@@ -92,8 +93,10 @@ async def test_add_and_change_satellite(hass: HomeAssistant) -> None:
     result = await entry.start_subentry_reconfigure_flow(hass, sub.subentry_id)
     assert result["type"] is FlowResultType.FORM
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"satellite": sat.entity_id, "media_players": []}
+        result["flow_id"],
+        {"satellite": sat.entity_id, "media_players": [], "announcements": True},
     )
     assert result["reason"] == "reconfigure_successful"
+    assert runtime.routes[sat.id].announcements is True
     assert runtime.routes[sat.id].media_players == ()
     assert runtime.routes[sat.id].tts_script is None

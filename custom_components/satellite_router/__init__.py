@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Coroutine
 from typing import Any
 
 from homeassistant.components.esphome import const as esphome_const
@@ -11,6 +13,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 
 from .const import (
+    CONF_ANNOUNCEMENTS,
     CONF_MEDIA_PLAYERS,
     CONF_SATELLITE,
     CONF_STT_SCRIPT,
@@ -18,6 +21,7 @@ from .const import (
     DOMAIN,
     ISSUE_INCOMPATIBLE,
     ISSUE_PATCHED_CORE,
+    PLAYBACK_TIMEOUT,
     SUBENTRY_SATELLITE,
 )
 from .router import Route, Router, check_compatible, install, satellite_class, uninstall
@@ -69,7 +73,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> bo
             f"{DOMAIN} {action}",
         )
 
-    router = Router(hass, run)
+    async def call(action: str, data: dict[str, Any]) -> None:
+        domain, service = action.split(".", 1)
+        async with asyncio.timeout(PLAYBACK_TIMEOUT):
+            await hass.services.async_call(domain, service, data, blocking=True)
+
+    @callback
+    def spawn(coro: Coroutine[Any, Any, None], name: str) -> None:
+        entry.async_create_background_task(hass, coro, name)
+
+    router = Router(hass, run, call, spawn)
     router.routes = routes_from(entry)
     entry.runtime_data = router
     install(cls, lambda: _active_router(hass))
@@ -89,6 +102,7 @@ def routes_from(entry: ConfigEntry) -> dict[str, Route]:
             media_players=tuple(data.get(CONF_MEDIA_PLAYERS) or ()),
             stt_script=data.get(CONF_STT_SCRIPT) or None,
             tts_script=data.get(CONF_TTS_SCRIPT) or None,
+            announcements=bool(data.get(CONF_ANNOUNCEMENTS)),
         )
     return routes
 
