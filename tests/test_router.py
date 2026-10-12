@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
 from homeassistant.components.esphome.assist_satellite import EsphomeAssistSatellite
@@ -239,3 +239,48 @@ async def test_response_script_without_media_players(hass: HomeAssistant, calls)
         ),
     ]
     assert ("VOICE_ASSISTANT_TTS_END", {}) in sent(sat)
+
+
+async def test_silenced_response_returns_satellite_to_idle(hass: HomeAssistant, calls) -> None:
+    """The device never plays a routed response, so the hook reports it finished at RUN_END."""
+    await _setup(hass, _entry())
+    sat = make_satellite(hass, ROUTED)
+    sat.tts_response_finished = MagicMock()
+    _run(sat, *CONVERSATION[:-1])
+    sat.tts_response_finished.assert_not_called()  # not before the run ends
+    _run(sat, CONVERSATION[-1])
+    sat.tts_response_finished.assert_called_once_with()
+    # Only once per run: a later run without a response doesn't repeat it.
+    _run(sat, (PipelineEventType.RUN_START, {"pipeline": "x"}), (PipelineEventType.RUN_END, None))
+    sat.tts_response_finished.assert_called_once_with()
+
+
+async def test_unrouted_satellite_reports_its_own_finish(hass: HomeAssistant, calls) -> None:
+    """An unrouted satellite plays its response and reports the finish itself."""
+    await _setup(hass, _entry())
+    sat = make_satellite(hass, "reg-other")
+    sat.tts_response_finished = MagicMock()
+    _run(sat, *CONVERSATION)
+    sat.tts_response_finished.assert_not_called()
+
+
+async def test_run_without_response_audio_not_finished(hass: HomeAssistant, calls) -> None:
+    """No audio was removed (e.g. an empty sentence-trigger reply), so nothing to finish."""
+    await _setup(hass, _entry())
+    sat = make_satellite(hass, ROUTED)
+    sat.tts_response_finished = MagicMock()
+    _run(
+        sat,
+        (PipelineEventType.RUN_START, {"pipeline": "x"}),
+        (PipelineEventType.TTS_END, {"tts_output": None}),
+        (PipelineEventType.RUN_END, None),
+    )
+    sat.tts_response_finished.assert_not_called()
+
+
+async def test_finish_error_never_breaks_satellite(hass: HomeAssistant, calls) -> None:
+    await _setup(hass, _entry())
+    sat = make_satellite(hass, ROUTED)
+    sat.tts_response_finished = MagicMock(side_effect=RuntimeError("boom"))
+    _run(sat, *CONVERSATION)  # must not raise
+    assert ("VOICE_ASSISTANT_RUN_END", {}) in sent(sat)

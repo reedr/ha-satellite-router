@@ -12,6 +12,13 @@ method. For a routed satellite it
 
 Events are only ever rewritten, never handled in ESPHome's place, so its own
 code keeps doing everything else. Unrouted satellites are untouched.
+
+One side effect needs undoing: the satellite entity enters ``responding`` on
+TTS_START and only returns to ``idle`` when the device reports it finished
+playing the response. A silenced device never plays it, so it never reports,
+and the entity would sit in ``responding`` until its next run. For runs whose
+audio was removed, the hook calls ``tts_response_finished()`` itself once
+RUN_END has been handled.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ class Router:
         self._run = run
         self.routes: dict[str, Route] = {}  # by entity registry ID
         self._pending: dict[str, dict[str, Any]] = {}
+        self._silenced: set[str] = set()  # runs whose response audio was removed
 
     @callback
     def process(self, registry_id: str | None, event: PipelineEvent) -> PipelineEvent:
@@ -93,6 +101,7 @@ class Router:
         elif event.type is PipelineEventType.TTS_END:
             self._speak(registry_id, route)
             if route.external_output and data.get("tts_output"):
+                self._silenced.add(registry_id)
                 return replace(event, data={**data, "tts_output": None})
 
         elif event.type is PipelineEventType.RUN_START:
@@ -103,6 +112,14 @@ class Router:
             self._speak(registry_id, route)
 
         return event
+
+    @callback
+    def take_silenced(self, registry_id: str | None, event: PipelineEvent) -> bool:
+        """Whether this RUN_END ends a run whose response audio was removed."""
+        if event.type is not PipelineEventType.RUN_END or registry_id not in self._silenced:
+            return False
+        self._silenced.discard(registry_id)
+        return True
 
     def _speak(self, registry_id: str, route: Route) -> None:
         """Hand a collected response to the TTS script, or to tts.speak."""
@@ -148,13 +165,22 @@ def install(cls: type, get_router: Callable[[], Router | None]) -> None:
 
     def on_pipeline_event(self: Any, event: PipelineEvent) -> None:
         router = get_router()
+        entry = getattr(self, "registry_entry", None)
+        registry_id = entry.id if entry else None
         if router is not None:
-            entry = getattr(self, "registry_entry", None)
             try:
-                event = router.process(entry.id if entry else None, event)
+                event = router.process(registry_id, event)
             except Exception:
                 _LOGGER.exception("Satellite Router failed on %s", event.type)
         original(self, event)
+        if router is not None:
+            try:
+                if router.take_silenced(registry_id, event):
+                    # The device never played the response, so it will never report
+                    # it finished; without this the entity stays "responding".
+                    self.tts_response_finished()
+            except Exception:
+                _LOGGER.exception("Satellite Router failed to end the response on %s", event.type)
 
     setattr(on_pipeline_event, _MARK, original)
     on_pipeline_event.__doc__ = original.__doc__
