@@ -466,3 +466,58 @@ async def test_unload_restores_announcement_methods(hass: HomeAssistant, calls) 
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert EsphomeAssistSatellite.__dict__["async_start_conversation"] is ORIGINAL_START
     assert EsphomeAssistSatellite.__dict__["async_announce"] is ORIGINAL_ANNOUNCE
+
+
+async def test_speakers_stay_ducked_through_follow_up(hass: HomeAssistant, calls) -> None:
+    """The question leaves the speakers ducked; the last response restores the original volume."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    _run(sat, *CONVERSATION[:3])
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})  # ducked
+    _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    # The question: leave the speakers at the ducked volume.
+    assert calls[1][0] == "script.tts_speak"
+    assert calls[1][1]["media_player_volume_level"] == 0.15
+
+    # The follow-up listen and the last response carry the original volume.
+    _run(sat, *CONVERSATION[:4], _intent_end(False), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    assert calls[2] == (
+        "script.stt_listen",
+        {"media_player_volume_level": 0.3, "media_player_entity_id": ["media_player.office_sonos"]},
+    )
+    assert calls[3][0] == "script.tts_speak"
+    assert calls[3][1]["media_player_volume_level"] == 0.3
+
+
+async def test_volume_restored_when_follow_up_fails(hass: HomeAssistant, calls) -> None:
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    sat.cli.send_voice_assistant_announcement_await_response.side_effect = RuntimeError("offline")
+    _run(sat, *CONVERSATION[:3])
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})
+    _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    assert calls[-1] == (
+        "script.tts_speak",
+        {"media_player_entity_id": ["media_player.office_sonos"], "media_player_volume_level": 0.3},
+    )
+
+
+async def test_stale_kept_volume_ignored(hass: HomeAssistant, calls) -> None:
+    """A follow-up that never started doesn't leak its volume into a later conversation."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry())
+    sat = _speaking_satellite(hass)
+    _run(sat, *CONVERSATION[:3])
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})
+    _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
+    await hass.async_block_till_done()
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.6})
+    with patch.object(hass.loop, "time", return_value=hass.loop.time() + 3600):
+        _run(sat, *CONVERSATION)
+    await hass.async_block_till_done()
+    assert calls[-2][1]["media_player_volume_level"] == 0.6

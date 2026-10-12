@@ -56,6 +56,9 @@ _LOGGER = logging.getLogger(__name__)
 _MARK = "__satellite_router_original__"
 _TTS_SPEAK_FIELDS = ("entity_id", "message", "media_player_entity_id", "language", "options")
 _ANNOUNCE_METHODS = ("async_announce", "async_start_conversation")
+# A follow-up listen starts within seconds of its question having played; a
+# kept volume older than this belongs to a conversation that never continued.
+FOLLOW_UP_WINDOW = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +100,9 @@ class Router:
         self._pending: dict[str, dict[str, Any]] = {}
         self._silenced: set[str] = set()  # runs whose response audio was removed
         self._follow_up: dict[str, Any] = {}  # satellites to reopen after the response
+        # The media players' volume before a conversation's first listen, kept
+        # across its follow-ups so the last response restores it.
+        self._volume_before: dict[str, tuple[Any, float]] = {}  # (volume, when kept)
 
     @callback
     def process(
@@ -112,7 +118,9 @@ class Router:
             if route.stt_script:
                 pending: dict[str, Any] = {}
                 if route.media_players and (player := self.hass.states.get(route.media_players[0])):
-                    pending["media_player_volume_level"] = player.attributes.get("volume_level")
+                    pending["media_player_volume_level"] = self._take_volume_before(
+                        registry_id, player.attributes.get("volume_level")
+                    )
                     pending["media_player_entity_id"] = list(route.media_players)
                 self._pending[registry_id] = pending
                 self._run(route.stt_script, dict(pending))
@@ -179,23 +187,71 @@ class Router:
         del self._pending[registry_id]
         if (satellite := self._follow_up.pop(registry_id, None)) is not None:
             assert self._spawn is not None
-            self._spawn(self._speak_then_listen(satellite, *request), "satellite_router follow-up")
+            action, data = request
+            if "media_player_volume_level" in data and route.media_players:
+                # The conversation isn't over: ask the script to leave the speakers
+                # as they are (ducked), and restore the volume after the last response.
+                self._volume_before[registry_id] = (
+                    data["media_player_volume_level"],
+                    self.hass.loop.time(),
+                )
+                player = self.hass.states.get(route.media_players[0])
+                data = {
+                    **data,
+                    "media_player_volume_level": player.attributes.get("volume_level")
+                    if player
+                    else data["media_player_volume_level"],
+                }
+            self._spawn(
+                self._speak_then_listen(satellite, registry_id, route, action, data),
+                "satellite_router follow-up",
+            )
         else:
             self._run(*request)
 
-    async def _speak_then_listen(self, satellite: Any, action: str, data: dict[str, Any]) -> None:
+    async def _speak_then_listen(
+        self, satellite: Any, registry_id: str, route: Route, action: str, data: dict[str, Any]
+    ) -> None:
         """Play a response that asks something, then reopen the satellite's microphone."""
         assert self._call is not None
         try:
             await self._call(action, data)
         except Exception:
             _LOGGER.exception("Satellite Router couldn't play the response; not listening again")
+            self._restore_volume(registry_id, route)
             return
+        if registry_id in self._volume_before:  # the window starts once the question has played
+            self._volume_before[registry_id] = (
+                self._volume_before[registry_id][0],
+                self.hass.loop.time(),
+            )
         try:
             # The cue isn't a TTS announcement, so the wrapped method passes it straight on.
             await satellite.async_start_conversation(_cue(self.hass, None, ""))
         except Exception:
             _LOGGER.exception("Satellite Router couldn't reopen the satellite's microphone")
+            self._restore_volume(registry_id, route)
+
+    def _take_volume_before(self, registry_id: str, current: Any) -> Any:
+        """The volume to restore after this listen: the conversation's, if one is going on."""
+        kept = self._volume_before.pop(registry_id, None)
+        if kept is None or self.hass.loop.time() - kept[1] > FOLLOW_UP_WINDOW:
+            return current
+        return kept[0]
+
+    def _restore_volume(self, registry_id: str, route: Route) -> None:
+        """No follow-up after all: have the response script restore the volume."""
+        if registry_id not in self._volume_before:
+            return
+        volume, _ = self._volume_before.pop(registry_id)
+        if route.tts_script and route.media_players:
+            self._run(
+                route.tts_script,
+                {
+                    "media_player_entity_id": list(route.media_players),
+                    "media_player_volume_level": volume,
+                },
+            )
 
     async def announce(
         self,
