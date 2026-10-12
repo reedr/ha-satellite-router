@@ -220,11 +220,7 @@ class Router:
             _LOGGER.exception("Satellite Router couldn't play the response; not listening again")
             self._restore_volume(registry_id, route)
             return
-        if registry_id in self._volume_before:  # the window starts once the question has played
-            self._volume_before[registry_id] = (
-                self._volume_before[registry_id][0],
-                self.hass.loop.time(),
-            )
+        self._keep_volume_fresh(registry_id)
         try:
             # The cue isn't a TTS announcement, so the wrapped method passes it straight on.
             await satellite.async_start_conversation(_cue(self.hass, None, ""))
@@ -290,14 +286,57 @@ class Router:
                 pending["media_player_volume_level"] = player.attributes.get("volume_level")
         if (request := _request(route, pending)) is None:
             return announcement
+        assert registry_id is not None
+        if conversation and "media_player_volume_level" in pending:
+            await self._duck(registry_id, route, pending)
         try:
             await self._call(*request)
         except Exception:
             _LOGGER.exception("Satellite Router couldn't play the announcement; the satellite will")
+            self._restore_volume(registry_id, route)
             return announcement
         if not conversation:
             return None
+        self._keep_volume_fresh(registry_id)
         return _cue(self.hass, announcement.preannounce_media_id, announcement.message)
+
+    async def _duck(self, registry_id: str, route: Route, pending: dict[str, Any]) -> None:
+        """Before a conversation's opening message: duck the speakers as for a listen.
+
+        The original volume is kept for the conversation's last response, and the
+        opening message is told to leave the speakers ducked.
+        """
+        if not route.stt_script or not route.media_players:
+            return
+        original = pending["media_player_volume_level"]
+        try:
+            await self._call(  # type: ignore[misc]
+                route.stt_script,
+                {
+                    "media_player_entity_id": list(route.media_players),
+                    "media_player_volume_level": original,
+                },
+            )
+        except Exception:
+            _LOGGER.exception("Satellite Router couldn't run the listening script")
+            return
+        self._volume_before[registry_id] = (original, self.hass.loop.time())
+        if player := self.hass.states.get(route.media_players[0]):
+            pending["media_player_volume_level"] = player.attributes.get("volume_level")
+
+    @callback
+    def abandon(self, registry_id: str | None) -> None:
+        """A conversation couldn't start on the satellite: give the volume back."""
+        if registry_id and (route := self.routes.get(registry_id)):
+            self._restore_volume(registry_id, route)
+
+    def _keep_volume_fresh(self, registry_id: str) -> None:
+        """Start the follow-up window once the message has played."""
+        if registry_id in self._volume_before:
+            self._volume_before[registry_id] = (
+                self._volume_before[registry_id][0],
+                self.hass.loop.time(),
+            )
 
 
 def _request(route: Route, pending: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
@@ -419,7 +458,13 @@ def _install_announce(
             if result is None:
                 return
             announcement = result
-        await original(self, announcement)
+        try:
+            await original(self, announcement)
+        except Exception:
+            if router is not None:
+                entry = getattr(self, "registry_entry", None)
+                router.abandon(entry.id if entry else None)
+            raise
 
     setattr(wrapper, _MARK, original)
     wrapper.__doc__ = original.__doc__

@@ -5,11 +5,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
 from homeassistant.components.assist_satellite import AssistSatelliteAnnouncement
 from homeassistant.components.esphome.assist_satellite import EsphomeAssistSatellite
 from homeassistant.config_entries import ConfigSubentryData
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -333,10 +334,50 @@ async def test_start_conversation_speaks_on_media_players(_, hass: HomeAssistant
     """The opening message plays on the Sonos; the satellite plays the chime, then listens."""
     hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
     await _setup(hass, _entry())
+    _ducking_listen_script(hass, calls)
     sat = _speaking_satellite(hass)
     await sat.async_start_conversation(_announcement())
-    assert calls == [("script.tts_speak", SPOKEN_QUESTION)]
+    # Ducked first, as for a listen; the question leaves the speakers ducked.
+    assert calls == [
+        (
+            "script.stt_listen",
+            {"media_player_entity_id": ["media_player.office_sonos"], "media_player_volume_level": 0.3},
+        ),
+        ("script.tts_speak", {**SPOKEN_QUESTION, "media_player_volume_level": 0.15}),
+    ]
     assert _device_announcements(sat) == [(CHIME, "Want the porch light on?", True, "")]
+
+    # The answer's listen and the last response get the original volume back.
+    _run(sat, *CONVERSATION)
+    await hass.async_block_till_done()
+    assert calls[2][1]["media_player_volume_level"] == 0.3
+    assert calls[3][1]["media_player_volume_level"] == 0.3
+
+
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_restores_volume_if_satellite_fails(_, hass, calls) -> None:
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.3})
+    await _setup(hass, _entry())
+    _ducking_listen_script(hass, calls)
+    sat = _speaking_satellite(hass)
+    sat.cli.send_voice_assistant_announcement_await_response.side_effect = RuntimeError("offline")
+    with pytest.raises(RuntimeError):
+        await sat.async_start_conversation(_announcement())
+    await hass.async_block_till_done()
+    assert calls[-1] == (
+        "script.tts_speak",
+        {"media_player_entity_id": ["media_player.office_sonos"], "media_player_volume_level": 0.3},
+    )
+
+
+def _ducking_listen_script(hass: HomeAssistant, calls) -> None:
+    """A listening script that ducks the speakers, like the real one."""
+
+    async def listen(call: ServiceCall) -> None:
+        calls.append(("script.stt_listen", dict(call.data)))
+        hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})
+
+    hass.services.async_register("script", "stt_listen", listen)
 
 
 @patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)

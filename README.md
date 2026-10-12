@@ -25,9 +25,10 @@ Everything else ESPHome does is untouched, and satellites without a route behave
 A satellite only opens its microphone for a conversation after it has played something, and a routed satellite
 plays nothing. So for routed satellites:
 
-- **`assist_satellite.start_conversation` / `ask_question`**: the opening message plays on the media players
-  (through the response script, waiting until it has finished), then the satellite plays the pre-announcement chime
-  and listens, without a wake word.
+- **`assist_satellite.start_conversation` / `ask_question`**: the listening script runs first (so the speakers are
+  ducked as for any conversation), the opening message plays on the media players (through the response script,
+  waiting until it has finished), then the satellite plays the pre-announcement chime and listens, without a wake
+  word. The speakers stay ducked until the conversation's last response.
 - **Follow-up questions** (a response with `continue_conversation`, e.g. an LLM asking "which room?"): the response
   plays on the media players, then the satellite gets the same chime and listens again. The speakers stay ducked
   in between: the response script is passed the current (ducked) volume as `media_player_volume_level`, and the
