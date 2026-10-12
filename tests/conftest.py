@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.components.esphome.assist_satellite import EsphomeAssistSatellite
@@ -15,6 +15,13 @@ pytest_plugins = ("pytest_homeassistant_custom_component",)
 @pytest.fixture(autouse=True)
 def enable_integration(enable_custom_integrations):
     """Allow Home Assistant to load the custom integration under test."""
+
+
+@pytest.fixture(autouse=True)
+def no_volume_settle_wait():
+    """Test media players don't report volume changes; don't wait for them."""
+    with patch("custom_components.satellite_router.router.VOLUME_SETTLE", 0):
+        yield
 
 
 @pytest.fixture(autouse=True)

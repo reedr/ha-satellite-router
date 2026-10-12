@@ -59,6 +59,11 @@ _ANNOUNCE_METHODS = ("async_announce", "async_start_conversation")
 # A follow-up listen starts within seconds of its question having played; a
 # kept volume older than this belongs to a conversation that never continued.
 FOLLOW_UP_WINDOW = 120
+# How long to wait for a media player to report the volume the listening script
+# set (Sonos reports it a moment after the change), and for that script to finish
+# before a response may restore the volume.
+VOLUME_SETTLE = 2.0
+LISTEN_WAIT = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +108,8 @@ class Router:
         # The media players' volume before a conversation's first listen, kept
         # across its follow-ups so the last response restores it.
         self._volume_before: dict[str, tuple[Any, float]] = {}  # (volume, when kept)
+        # Set once a run's listening script has finished and its volume change shows.
+        self._listened: dict[str, asyncio.Event] = {}
 
     @callback
     def process(
@@ -123,7 +130,13 @@ class Router:
                     )
                     pending["media_player_entity_id"] = list(route.media_players)
                 self._pending[registry_id] = pending
-                self._run(route.stt_script, dict(pending))
+                if self._call is not None and self._spawn is not None:
+                    done = self._listened[registry_id] = asyncio.Event()
+                    self._spawn(
+                        self._listen(route, dict(pending), done), "satellite_router listen"
+                    )
+                else:
+                    self._run(route.stt_script, dict(pending))
 
         elif event.type is PipelineEventType.INTENT_PROGRESS:
             if route.external_output and data.get("tts_start_streaming"):
@@ -185,35 +198,79 @@ class Router:
         if not pending or (request := _request(route, pending)) is None:
             return
         del self._pending[registry_id]
+        listened = self._listened.get(registry_id)
         if (satellite := self._follow_up.pop(registry_id, None)) is not None:
             assert self._spawn is not None
-            action, data = request
-            if "media_player_volume_level" in data and route.media_players:
-                # The conversation isn't over: ask the script to leave the speakers
-                # as they are (ducked), and restore the volume after the last response.
-                self._volume_before[registry_id] = (
-                    data["media_player_volume_level"],
-                    self.hass.loop.time(),
-                )
-                player = self.hass.states.get(route.media_players[0])
-                data = {
-                    **data,
-                    "media_player_volume_level": player.attributes.get("volume_level")
-                    if player
-                    else data["media_player_volume_level"],
-                }
             self._spawn(
-                self._speak_then_listen(satellite, registry_id, route, action, data),
+                self._speak_then_listen(satellite, registry_id, route, *request, listened),
                 "satellite_router follow-up",
             )
+        elif listened is not None and not listened.is_set() and self._spawn is not None:
+            # A run that ended at once (e.g. nothing heard): restoring the volume
+            # before the listening script has ducked it would leave it ducked.
+            self._spawn(self._run_after(listened, *request), "satellite_router response")
         else:
             self._run(*request)
 
+    async def _listen(self, route: Route, data: dict[str, Any], done: asyncio.Event) -> None:
+        """Run the listening script and wait until its volume change shows."""
+        assert self._call is not None and route.stt_script is not None
+        try:
+            player = route.media_players[0] if route.media_players else None
+            before = self._volume(player)
+            await self._call(route.stt_script, data)
+            if player:
+                await self._volume_settled(player, before)
+        except Exception:
+            _LOGGER.exception("Satellite Router couldn't run the listening script")
+        finally:
+            done.set()
+
+    async def _run_after(self, listened: asyncio.Event, action: str, data: dict[str, Any]) -> None:
+        try:
+            async with asyncio.timeout(LISTEN_WAIT):
+                await listened.wait()
+        except TimeoutError:
+            pass
+        self._run(action, data)
+
+    def _volume(self, entity_id: str | None) -> Any:
+        state = self.hass.states.get(entity_id) if entity_id else None
+        return state.attributes.get("volume_level") if state else None
+
+    async def _volume_settled(self, entity_id: str, before: Any) -> Any:
+        """The player's volume once it differs from ``before`` (or after a short wait)."""
+        deadline = self.hass.loop.time() + VOLUME_SETTLE
+        while (volume := self._volume(entity_id)) == before and self.hass.loop.time() < deadline:
+            await asyncio.sleep(0.1)
+        return volume
+
     async def _speak_then_listen(
-        self, satellite: Any, registry_id: str, route: Route, action: str, data: dict[str, Any]
+        self,
+        satellite: Any,
+        registry_id: str,
+        route: Route,
+        action: str,
+        data: dict[str, Any],
+        listened: asyncio.Event | None,
     ) -> None:
         """Play a response that asks something, then reopen the satellite's microphone."""
         assert self._call is not None
+        if listened is not None:
+            try:
+                async with asyncio.timeout(LISTEN_WAIT):
+                    await listened.wait()
+            except TimeoutError:
+                pass
+        if "media_player_volume_level" in data and route.media_players:
+            # The conversation isn't over: ask the script to leave the speakers as
+            # they are (ducked), and restore the volume after the last response.
+            self._volume_before[registry_id] = (
+                data["media_player_volume_level"],
+                self.hass.loop.time(),
+            )
+            current = self._volume(route.media_players[0])
+            data = {**data, "media_player_volume_level": current}
         try:
             await self._call(action, data)
         except Exception:
@@ -321,8 +378,11 @@ class Router:
             _LOGGER.exception("Satellite Router couldn't run the listening script")
             return
         self._volume_before[registry_id] = (original, self.hass.loop.time())
-        if player := self.hass.states.get(route.media_players[0]):
-            pending["media_player_volume_level"] = player.attributes.get("volume_level")
+        # Sonos reports the new volume a moment later; reading it at once would
+        # tell the response script to "restore" the unducked volume.
+        pending["media_player_volume_level"] = await self._volume_settled(
+            route.media_players[0], original
+        )
 
     @callback
     def abandon(self, registry_id: str | None) -> None:

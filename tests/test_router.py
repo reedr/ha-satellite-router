@@ -54,7 +54,7 @@ def _entry(**route) -> MockConfigEntry:
 async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 def _run(sat, *events: tuple[PipelineEventType, dict | None]) -> None:
@@ -81,7 +81,7 @@ async def test_routed_conversation(hass: HomeAssistant, calls) -> None:
     await _setup(hass, _entry())
     sat = make_satellite(hass, ROUTED)
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     # The satellite hears everything but the audio.
     assert sent(sat) == [
@@ -118,7 +118,7 @@ async def test_unrouted_satellite_untouched(hass: HomeAssistant, calls) -> None:
     await _setup(hass, _entry())
     sat = make_satellite(hass, "reg-other")
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     events = dict(sent(sat))
     assert events["VOICE_ASSISTANT_INTENT_PROGRESS"] == {"tts_start_streaming": "1"}
     assert events["VOICE_ASSISTANT_TTS_END"]["url"].endswith("/api/tts_proxy/abc.flac")
@@ -129,7 +129,7 @@ async def test_tts_speak_without_script(hass: HomeAssistant, calls) -> None:
     await _setup(hass, _entry(tts_script=None, stt_script=None))
     sat = make_satellite(hass, ROUTED)
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls == [
         (
             "tts.speak",
@@ -160,10 +160,10 @@ async def test_route_changes_apply_without_reload(hass: HomeAssistant, calls) ->
     hass.config_entries.async_update_subentry(
         entry, sub, data={**sub.data, "tts_script": None, "stt_script": None}
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     sat = make_satellite(hass, ROUTED)
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert [c[0] for c in calls] == ["tts.speak"]
 
 
@@ -215,7 +215,7 @@ async def test_tts_speak_fallback_with_listening_script(hass: HomeAssistant, cal
     await _setup(hass, _entry(tts_script=None))
     sat = make_satellite(hass, ROUTED)
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[1] == (
         "tts.speak",
         {
@@ -233,7 +233,7 @@ async def test_response_script_without_media_players(hass: HomeAssistant, calls)
     await _setup(hass, _entry(media_players=[], stt_script=None))
     sat = make_satellite(hass, ROUTED)
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls == [
         (
             "script.tts_speak",
@@ -349,7 +349,7 @@ async def test_start_conversation_speaks_on_media_players(_, hass: HomeAssistant
 
     # The answer's listen and the last response get the original volume back.
     _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[2][1]["media_player_volume_level"] == 0.3
     assert calls[3][1]["media_player_volume_level"] == 0.3
 
@@ -363,7 +363,7 @@ async def test_start_conversation_restores_volume_if_satellite_fails(_, hass, ca
     sat.cli.send_voice_assistant_announcement_await_response.side_effect = RuntimeError("offline")
     with pytest.raises(RuntimeError):
         await sat.async_start_conversation(_announcement())
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[-1] == (
         "script.tts_speak",
         {"media_player_entity_id": ["media_player.office_sonos"], "media_player_volume_level": 0.3},
@@ -477,7 +477,7 @@ async def test_follow_up_reopens_microphone_after_response(hass: HomeAssistant, 
         lambda *a, **k: order.append(f"listen {len(calls)} played")
     )
     _run(sat, *CONVERSATION[:4], _intent_end(True), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert [c[0] for c in calls] == ["script.stt_listen", "script.tts_speak"]
     assert _device_announcements(sat) == [(CHIME, "", True, "")]
     assert order == ["listen 2 played"]  # only once the response finished playing
@@ -487,7 +487,7 @@ async def test_no_follow_up_without_continue(hass: HomeAssistant, calls) -> None
     await _setup(hass, _entry())
     sat = _speaking_satellite(hass)
     _run(sat, *CONVERSATION[:4], _intent_end(False), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert _device_announcements(sat) == []
 
 
@@ -496,7 +496,7 @@ async def test_follow_up_skipped_when_playback_fails(hass: HomeAssistant, calls)
     await _setup(hass, _entry())
     sat = _speaking_satellite(hass)
     _run(sat, *CONVERSATION[:4], _intent_end(True), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert _device_announcements(sat) == []
 
 
@@ -517,14 +517,14 @@ async def test_speakers_stay_ducked_through_follow_up(hass: HomeAssistant, calls
     _run(sat, *CONVERSATION[:3])
     hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})  # ducked
     _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     # The question: leave the speakers at the ducked volume.
     assert calls[1][0] == "script.tts_speak"
     assert calls[1][1]["media_player_volume_level"] == 0.15
 
     # The follow-up listen and the last response carry the original volume.
     _run(sat, *CONVERSATION[:4], _intent_end(False), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[2] == (
         "script.stt_listen",
         {"media_player_volume_level": 0.3, "media_player_entity_id": ["media_player.office_sonos"]},
@@ -541,7 +541,7 @@ async def test_volume_restored_when_follow_up_fails(hass: HomeAssistant, calls) 
     _run(sat, *CONVERSATION[:3])
     hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})
     _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[-1] == (
         "script.tts_speak",
         {"media_player_entity_id": ["media_player.office_sonos"], "media_player_volume_level": 0.3},
@@ -556,9 +556,65 @@ async def test_stale_kept_volume_ignored(hass: HomeAssistant, calls) -> None:
     _run(sat, *CONVERSATION[:3])
     hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.15})
     _run(sat, CONVERSATION[3], _intent_end(True), *CONVERSATION[4:])
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.6})
     with patch.object(hass.loop, "time", return_value=hass.loop.time() + 3600):
         _run(sat, *CONVERSATION)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls[-2][1]["media_player_volume_level"] == 0.6
+
+
+def _lagging_listen_script(hass: HomeAssistant, calls, lag: float = 0.3) -> None:
+    """A listening script that ducks, with the player reporting it a moment later (Sonos)."""
+
+    async def listen(call: ServiceCall) -> None:
+        calls.append(("script.stt_listen", dict(call.data)))
+        hass.loop.call_later(
+            lag,
+            hass.states.async_set,
+            "media_player.office_sonos",
+            "playing",
+            {"volume_level": 0.15},
+        )
+
+    hass.services.async_register("script", "stt_listen", listen)
+
+
+@patch("custom_components.satellite_router.router.VOLUME_SETTLE", 2)
+@patch("custom_components.satellite_router.router.async_get_pipeline", return_value=PIPELINE)
+async def test_start_conversation_waits_for_reported_duck(_, hass, calls) -> None:
+    """The question is told the ducked volume even when the player reports it late."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.5})
+    await _setup(hass, _entry())
+    _lagging_listen_script(hass, calls)
+    sat = _speaking_satellite(hass)
+    await sat.async_start_conversation(_announcement())
+    assert calls[1][0] == "script.tts_speak"
+    assert calls[1][1]["media_player_volume_level"] == 0.15
+
+
+@patch("custom_components.satellite_router.router.VOLUME_SETTLE", 2)
+async def test_restore_waits_for_duck_when_run_ends_at_once(hass: HomeAssistant, calls) -> None:
+    """A run that fails straight after listening starts restores only after the duck shows."""
+    hass.states.async_set("media_player.office_sonos", "playing", {"volume_level": 0.5})
+    await _setup(hass, _entry())
+    _lagging_listen_script(hass, calls)
+    seen: list[float] = []
+
+    async def speak(call: ServiceCall) -> None:
+        seen.append(hass.states.get("media_player.office_sonos").attributes["volume_level"])
+        calls.append(("script.tts_speak", dict(call.data)))
+
+    hass.services.async_register("script", "tts_speak", speak)
+    sat = _speaking_satellite(hass)
+    _run(
+        sat,
+        (PipelineEventType.RUN_START, {"pipeline": "x"}),
+        (PipelineEventType.STT_START, {"engine": "stt.x", "metadata": {}}),
+        (PipelineEventType.ERROR, {"code": "stt-stream-failed", "message": "failed"}),
+        (PipelineEventType.RUN_END, None),
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert [c[0] for c in calls] == ["script.stt_listen", "script.tts_speak"]
+    assert calls[1][1]["media_player_volume_level"] == 0.5  # restore to the original
+    assert seen == [0.15]  # and only once the duck had shown
