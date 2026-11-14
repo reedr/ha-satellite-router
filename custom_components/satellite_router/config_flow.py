@@ -19,6 +19,7 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_ANNOUNCEMENTS,
+    CONF_DEVICE,
     CONF_MEDIA_PLAYERS,
     CONF_SATELLITE,
     CONF_STT_SCRIPT,
@@ -27,10 +28,12 @@ from .const import (
     LEGACY_STT_SCRIPT,
     LEGACY_TTS_MEDIA_PLAYER_ENTITY_ID,
     LEGACY_TTS_MEDIA_PLAYER_SCRIPT,
+    SUBENTRY_DEVICE,
     SUBENTRY_SATELLITE,
 )
 
 ESPHOME = "esphome"
+MOBILE_APP = "mobile_app"
 
 
 def legacy_routes(hass: HomeAssistant) -> list[dict[str, Any]]:
@@ -82,8 +85,8 @@ class RouterConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(
         cls, config_entry: ConfigEntry
     ) -> dict[str, type[ConfigSubentryFlow]]:
-        """Satellites are added as subentries."""
-        return {SUBENTRY_SATELLITE: SatelliteSubentryFlow}
+        """Satellites, and devices running their own Assist, are added as subentries."""
+        return {SUBENTRY_SATELLITE: SatelliteSubentryFlow, SUBENTRY_DEVICE: DeviceSubentryFlow}
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Create the entry, importing routes from patched ESPHome options if any."""
@@ -183,5 +186,79 @@ class SatelliteSubentryFlow(ConfigSubentryFlow):
         return self.async_show_form(
             step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(_schema(self.hass), suggested),
+            errors=errors,
+        )
+
+
+def _device_schema() -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Required(CONF_DEVICE): selector.DeviceSelector(
+                selector.DeviceSelectorConfig(integration=MOBILE_APP)
+            ),
+            vol.Optional(CONF_MEDIA_PLAYERS): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="media_player", multiple=True)
+            ),
+            vol.Optional(CONF_STT_SCRIPT): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="script")
+            ),
+            vol.Optional(CONF_TTS_SCRIPT): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="script")
+            ),
+        }
+    )
+
+
+class DeviceSubentryFlow(ConfigSubentryFlow):
+    """Add or change the route of a device that runs Assist itself (e.g. a Companion app tablet)."""
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
+        """Choose a device and where its speech goes."""
+        return await self._async_step("user", user_input)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Change a route."""
+        return await self._async_step("reconfigure", user_input)
+
+    async def _async_step(
+        self, step_id: str, user_input: dict[str, Any] | None
+    ) -> SubentryFlowResult:
+        dev_reg = dr.async_get(self.hass)
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            device = dev_reg.async_get(user_input[CONF_DEVICE])
+            if device is None:
+                errors[CONF_DEVICE] = "unknown_device"
+            else:
+                data: dict[str, Any] = {
+                    CONF_DEVICE: device.id,
+                    CONF_MEDIA_PLAYERS: user_input.get(CONF_MEDIA_PLAYERS) or [],
+                }
+                for key in (CONF_STT_SCRIPT, CONF_TTS_SCRIPT):
+                    if user_input.get(key):
+                        data[key] = user_input[key]
+                title = device.name_by_user or device.name or device.id
+                unique_id = f"device:{device.id}"
+                if step_id == "reconfigure":
+                    return self.async_update_and_abort(
+                        self._get_entry(),
+                        self._get_reconfigure_subentry(),
+                        data=data,
+                        title=title,
+                        unique_id=unique_id,
+                    )
+                for sub in self._get_entry().subentries.values():
+                    if sub.unique_id == unique_id:
+                        return self.async_abort(reason="already_configured")
+                return self.async_create_entry(title=title, data=data, unique_id=unique_id)
+
+        suggested: dict[str, Any] = dict(user_input or {})
+        if step_id == "reconfigure" and user_input is None:
+            suggested = dict(self._get_reconfigure_subentry().data)
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=self.add_suggested_values_to_schema(_device_schema(), suggested),
             errors=errors,
         )

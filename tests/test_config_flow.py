@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -100,3 +101,56 @@ async def test_add_and_change_satellite(hass: HomeAssistant) -> None:
     assert runtime.routes[sat.id].announcements is True
     assert runtime.routes[sat.id].media_players == ()
     assert runtime.routes[sat.id].tts_script is None
+
+
+async def test_add_and_change_device(hass: HomeAssistant) -> None:
+    app = MockConfigEntry(domain="mobile_app", title="Office Tablet")
+    app.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=app.entry_id, identifiers={("mobile_app", "tablet")}, name="RMR Tablet"
+    )
+    dr.async_get(hass).async_update_device(device.id, name_by_user="Office Tablet")
+    entry = MockConfigEntry(domain=DOMAIN, title="Satellite Router")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "device"), context={"source": SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            "device": device.id,
+            "media_players": ["media_player.office_sonos"],
+            "stt_script": "script.stt_listen",
+            "tts_script": "script.tts_speak",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Office Tablet"
+    [sub] = entry.subentries.values()
+    assert sub.subentry_type == "device"
+    assert dict(sub.data) == {
+        "device": device.id,
+        "media_players": ["media_player.office_sonos"],
+        "stt_script": "script.stt_listen",
+        "tts_script": "script.tts_speak",
+    }
+    runtime = entry.runtime_data
+    assert runtime.routes[f"device:{device.id}"].media_players == ("media_player.office_sonos",)
+    assert runtime.has_device_routes
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "device"), context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.subentries.async_configure(result["flow_id"], {"device": device.id})
+    assert result["reason"] == "already_configured"
+
+    result = await entry.start_subentry_reconfigure_flow(hass, sub.subentry_id)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"device": device.id, "media_players": ["media_player.den_sonos"]}
+    )
+    assert result["reason"] == "reconfigure_successful"
+    assert runtime.routes[f"device:{device.id}"].media_players == ("media_player.den_sonos",)
+    assert runtime.routes[f"device:{device.id}"].tts_script is None

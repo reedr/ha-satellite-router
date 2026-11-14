@@ -3,7 +3,8 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/reedr/ha-satellite-router)
 
 Plays ESPHome voice satellites' responses on other media players (Sonos, for example) instead of the satellite's
-speaker, and runs a script when a satellite starts listening (e.g. to duck the room's music). No changes to Home
+speaker, and runs a script when a satellite starts listening (e.g. to duck the room's music). Tablets using the
+Companion app's Assist can be routed the same way. No changes to Home
 Assistant or ESPHome are needed.
 
 ## How it works
@@ -45,6 +46,26 @@ If an ESPHome update changes the code this hooks into, Satellite Router stays in
 satellites go back to playing responses themselves until it is updated. It also stays inactive, with a repair, on a
 Home Assistant whose ESPHome integration has been patched with the same feature, so responses never play twice.
 
+### Devices that run Assist themselves (Companion app tablets)
+
+A tablet using the Home Assistant Companion app's Assist isn't an ESPHome satellite: it runs the pipeline itself
+over the websocket and plays the response audio it is sent. Such a device can be routed too, keyed by its device
+(the Android app sends its device ID with every request). Satellite Router then wraps core's pipeline run for that
+device's requests, and only those:
+
+- listening runs the **listening script**, the response plays through the **response script** (or `tts.speak`),
+  and the device shows the text but plays nothing. The audio URL in the run-start event is removed (the app plays it
+  at once) and the one in tts-end is blanked rather than removed (the app can't parse a missing one).
+- **Follow-up questions** are spoken by the device itself: with nothing to play, the app reopens its microphone at
+  once and would hear the media players asking. The speakers stay ducked until the conversation's last response,
+  which restores their original volume.
+- While such a request is going on, the state `satellite_router.active_device` holds the device's area (state) and
+  device ID / name (attributes), and is `idle` otherwise. Scripts can use it to know which room a request came from,
+  for example to play music "here".
+
+If a Home Assistant update changes the pipeline code this hooks into, a warning is logged and devices go back to
+playing responses themselves; satellites are unaffected.
+
 ## Setup
 
 **Settings → Devices & services → Add integration → Satellite Router**. If the ESPHome entries carry the options of
@@ -56,6 +77,9 @@ Add or change satellites with **Add satellite** on the integration's page:
 - **Media players**: where responses play.
 - **Listening script** (optional): runs when the satellite starts listening.
 - **Response script** (optional): plays the response; without it, `tts.speak` is used.
+
+Add a device with **Add device**: pick the Companion app device (Mobile App integration), and its media players and
+scripts as above.
 
 Changes take effect immediately.
 

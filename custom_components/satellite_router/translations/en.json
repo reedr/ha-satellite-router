@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "description": "Route ESPHome voice satellites' responses to other media players. Satellites are added as entries under the integration.\n\nRoutes found in patched ESPHome options to import: {count} ({titles})."
+        "description": "Route voice satellites' responses to other media players. ESPHome satellites, and devices that run Assist themselves (such as a Companion app tablet), are added as entries under the integration.\n\nRoutes found in patched ESPHome options to import: {count} ({titles})."
       }
     },
     "abort": {
@@ -57,6 +57,52 @@
       },
       "abort": {
         "already_configured": "That satellite already has a route.",
+        "reconfigure_successful": "The route was updated."
+      }
+    },
+    "device": {
+      "entry_type": "Device",
+      "initiate_flow": {
+        "user": "Add device",
+        "reconfigure": "Change device"
+      },
+      "step": {
+        "user": {
+          "title": "Route a device",
+          "data": {
+            "device": "Device",
+            "media_players": "Media players",
+            "stt_script": "Listening script",
+            "tts_script": "Response script"
+          },
+          "data_description": {
+            "device": "A device that runs Assist itself, such as a tablet using the Companion app's Assist. Its requests must carry its device ID (the Android app sends it).",
+            "media_players": "Where responses play. The first one's volume is passed to the listening script.",
+            "stt_script": "Runs when the device starts listening, with media_player_entity_id and media_player_volume_level (e.g. to duck the speakers).",
+            "tts_script": "Plays the response, with entity_id (TTS engine), message, language, options and the fields above. Without it, tts.speak plays the message on the media players. The device shows the text but plays nothing, except a follow-up question, which it speaks itself so its microphone doesn't hear the speakers."
+          }
+        },
+        "reconfigure": {
+          "title": "Change a device's route",
+          "data": {
+            "device": "Device",
+            "media_players": "Media players",
+            "stt_script": "Listening script",
+            "tts_script": "Response script"
+          },
+          "data_description": {
+            "device": "A device that runs Assist itself.",
+            "media_players": "Where responses play. The first one's volume is passed to the listening script.",
+            "stt_script": "Runs when the device starts listening.",
+            "tts_script": "Plays the response. Without it, tts.speak plays the message on the media players."
+          }
+        }
+      },
+      "error": {
+        "unknown_device": "That device isn't in the device registry."
+      },
+      "abort": {
+        "already_configured": "That device already has a route.",
         "reconfigure_successful": "The route was updated."
       }
     }

@@ -1,4 +1,4 @@
-"""Satellite Router: send ESPHome voice satellites' responses to other speakers."""
+"""Satellite Router: send voice satellites' (and Assist devices') responses to other speakers."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from homeassistant.helpers import issue_registry as ir
 
 from .const import (
     CONF_ANNOUNCEMENTS,
+    CONF_DEVICE,
     CONF_MEDIA_PLAYERS,
     CONF_SATELLITE,
     CONF_STT_SCRIPT,
@@ -21,10 +22,23 @@ from .const import (
     DOMAIN,
     ISSUE_INCOMPATIBLE,
     ISSUE_PATCHED_CORE,
+    DEVICE_KEY,
     PLAYBACK_TIMEOUT,
+    SUBENTRY_DEVICE,
     SUBENTRY_SATELLITE,
 )
-from .router import Route, Router, check_compatible, install, satellite_class, uninstall
+from .router import (
+    Route,
+    Router,
+    check_compatible,
+    check_pipeline_compatible,
+    install,
+    install_pipeline,
+    pipeline_run_class,
+    satellite_class,
+    uninstall,
+    uninstall_pipeline,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,19 +100,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> bo
     router.routes = routes_from(entry)
     entry.runtime_data = router
     install(cls, lambda: _active_router(hass))
+    run_cls = pipeline_run_class()
+    if (reason := check_pipeline_compatible(run_cls)) is not None:
+        # Satellites still work; only devices running their own pipelines aren't routed.
+        _LOGGER.warning("Can't route Assist devices' own pipeline runs: %s", reason)
+    else:
+        install_pipeline(run_cls, lambda: _active_router(hass))
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
 @callback
 def routes_from(entry: ConfigEntry) -> dict[str, Route]:
-    """One route per satellite subentry."""
+    """One route per satellite or device subentry."""
     routes: dict[str, Route] = {}
     for subentry in entry.subentries.values():
-        if subentry.subentry_type != SUBENTRY_SATELLITE:
-            continue
         data = subentry.data
-        routes[data[CONF_SATELLITE]] = Route(
+        if subentry.subentry_type == SUBENTRY_SATELLITE:
+            key = data[CONF_SATELLITE]
+        elif subentry.subentry_type == SUBENTRY_DEVICE:
+            key = DEVICE_KEY + data[CONF_DEVICE]
+        else:
+            continue
+        routes[key] = Route(
             media_players=tuple(data.get(CONF_MEDIA_PLAYERS) or ()),
             stt_script=data.get(CONF_STT_SCRIPT) or None,
             tts_script=data.get(CONF_TTS_SCRIPT) or None,
@@ -125,4 +149,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> b
     """Restore ESPHome's own behaviour."""
     if entry.runtime_data is not None:
         uninstall(satellite_class())
+        uninstall_pipeline(pipeline_run_class())
     return True

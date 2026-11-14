@@ -27,6 +27,21 @@ players and awaited, and then the satellite is sent a short cue (the
 pre-announcement chime) as an announcement that starts a conversation. This
 wraps ESPHome's ``async_start_conversation`` (and ``async_announce``, for
 routes that route announcements) the same way.
+
+Devices that run Assist pipelines themselves, such as a tablet using the
+Companion app's Assist, aren't ESPHome satellites: their runs come over the
+websocket and the app plays the response audio it is sent. For those, routes
+are keyed by device and ``PipelineRun.process_event`` is wrapped. A routed
+device's run is rewritten the same way, with two differences the Android app
+needs: the run-start audio URL is removed (the app plays it at once), and the
+tts-end URL is blanked rather than removed (the app can't parse a missing
+one; a blank one it skips). A run that ends in a follow-up question is left
+alone from intent-end on, so the device speaks the question itself; the app
+reopens its microphone straight away when it has nothing to play, and would
+hear the media players asking. The speakers stay ducked until the
+conversation's last response. While such a run is going on,
+``satellite_router.active_device`` names the device's area, for scripts that
+need to know where the request came from.
 """
 
 from __future__ import annotations
@@ -50,6 +65,9 @@ from homeassistant.components.assist_satellite import (
 from homeassistant.components.assist_satellite.const import PREANNOUNCE_URL
 from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+
+from .const import ACTIVE_DEVICE_STATE, DEVICE_KEY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +128,74 @@ class Router:
         self._volume_before: dict[str, tuple[Any, float]] = {}  # (volume, when kept)
         # Set once a run's listening script has finished and its volume change shows.
         self._listened: dict[str, asyncio.Event] = {}
+        # Device routes whose current run ends in a follow-up question: left alone.
+        self._passthrough: set[str] = set()
+
+    @property
+    def has_device_routes(self) -> bool:
+        """Whether any route is for a device rather than an ESPHome satellite."""
+        return any(key.startswith(DEVICE_KEY) for key in self.routes)
+
+    @callback
+    def process_device(self, device_id: str, event: PipelineEvent) -> PipelineEvent:
+        """Act on an event of a device's own pipeline run; return the event it should get."""
+        key = DEVICE_KEY + device_id
+        route = self.routes.get(key)
+        if route is None:
+            return event
+        data = event.data or {}
+        if event.type is PipelineEventType.RUN_START:
+            self._passthrough.discard(key)
+            self._set_active(device_id)
+        elif event.type is PipelineEventType.RUN_END:
+            self._clear_active(device_id)
+        if (
+            event.type is PipelineEventType.INTENT_END
+            and route.external_output
+            and (data.get("intent_output") or {}).get("continue_conversation")
+        ):
+            # The device speaks the question and listens again; keep the speakers'
+            # original volume for the conversation's last response.
+            self._passthrough.add(key)
+            pending = self._pending.pop(key, None) or {}
+            if "media_player_volume_level" in pending:
+                self._volume_before[key] = (
+                    pending["media_player_volume_level"],
+                    self.hass.loop.time(),
+                )
+            return event
+        if key in self._passthrough:
+            if event.type is PipelineEventType.RUN_END:
+                self._passthrough.discard(key)
+            return event
+        original = data.get("tts_output")
+        event = self.process(key, event)
+        if event.type is PipelineEventType.TTS_END and original and not (event.data or {}).get("tts_output"):
+            # No satellite to return to idle; and the app needs an (empty) URL.
+            self._silenced.discard(key)
+            return replace(event, data={**(event.data or {}), "tts_output": {**original, "url": ""}})
+        return event
+
+    def _set_active(self, device_id: str) -> None:
+        device = dr.async_get(self.hass).async_get(device_id)
+        area = device.area_id if device else None
+        self.hass.states.async_set(
+            ACTIVE_DEVICE_STATE,
+            area or "unknown",
+            {
+                "device_id": device_id,
+                "device": (device.name_by_user or device.name) if device else None,
+                "area_id": area,
+                "friendly_name": "Satellite Router active device",
+            },
+        )
+
+    def _clear_active(self, device_id: str) -> None:
+        current = self.hass.states.get(ACTIVE_DEVICE_STATE)
+        if current is not None and current.attributes.get("device_id") == device_id:
+            self.hass.states.async_set(
+                ACTIVE_DEVICE_STATE, "idle", {"friendly_name": "Satellite Router active device"}
+            )
 
     @callback
     def process(
@@ -529,6 +615,74 @@ def _install_announce(
     setattr(wrapper, _MARK, original)
     wrapper.__doc__ = original.__doc__
     setattr(cls, name, wrapper)
+
+
+def pipeline_run_class() -> type | None:
+    """Core's pipeline run class, or None if it can't be found."""
+    try:
+        from homeassistant.components.assist_pipeline.run import PipelineRun
+    except ImportError:
+        try:
+            from homeassistant.components.assist_pipeline.pipeline import PipelineRun
+        except ImportError:
+            return None
+    return PipelineRun
+
+
+def check_pipeline_compatible(cls: type | None) -> str | None:
+    """Why device runs can't be routed on this core, or None."""
+    if cls is None:
+        return "assist_pipeline's PipelineRun is missing"
+    params = _params(cls, "process_event")
+    if params is None:
+        return "PipelineRun.process_event is missing"
+    if params != ["self", "event"]:
+        return f"PipelineRun.process_event{params} has changed"
+    fields = getattr(cls, "__dataclass_fields__", {})
+    for name in ("device_id", "satellite_id"):
+        # Public properties since 2026.11; before that only the private fields.
+        if not isinstance(getattr(cls, name, None), property) and f"_{name}" not in fields:
+            return f"PipelineRun.{name} is missing"
+    return None
+
+
+def _run_id(run: Any, name: str) -> str | None:
+    """A run's device_id / satellite_id (property, or the older private field)."""
+    value = getattr(type(run), name, None)
+    if isinstance(value, property):
+        return getattr(run, name)
+    return getattr(run, f"_{name}", None)
+
+
+def install_pipeline(cls: type, get_router: Callable[[], Router | None]) -> None:
+    """Wrap ``PipelineRun.process_event`` (once), for routed devices' runs."""
+    original = cls.__dict__["process_event"]
+    if hasattr(original, _MARK):
+        return
+
+    def process_event(self: Any, event: PipelineEvent) -> None:
+        router = get_router()
+        # Satellite runs are routed by the satellite hook; only devices running
+        # their own pipelines (no satellite) are handled here.
+        if router is not None and router.has_device_routes and _run_id(self, "satellite_id") is None:
+            device_id = _run_id(self, "device_id")
+            if device_id:
+                try:
+                    event = router.process_device(device_id, event)
+                except Exception:
+                    _LOGGER.exception("Satellite Router failed on %s", event.type)
+        original(self, event)
+
+    setattr(process_event, _MARK, original)
+    process_event.__doc__ = original.__doc__
+    cls.process_event = process_event
+
+
+def uninstall_pipeline(cls: type | None) -> None:
+    """Restore core's own ``PipelineRun.process_event``."""
+    current = cls.__dict__.get("process_event") if cls is not None else None
+    if current is not None and hasattr(current, _MARK):
+        cls.process_event = getattr(current, _MARK)
 
 
 def uninstall(cls: type) -> None:
