@@ -42,6 +42,11 @@ hear the media players asking. The speakers stay ducked until the
 conversation's last response. While such a run is going on,
 ``satellite_router.active_device`` names the device's area, for scripts that
 need to know where the request came from.
+
+Each routed device also gets a voice mute switch. Turning it on asks the
+Android app to turn its wake word off (``command_wake_word_detection``), and
+while it is on any spoken request from the device that still arrives is ended
+at speech-to-text, before its audio is transcribed. Typed requests still work.
 """
 
 from __future__ import annotations
@@ -58,6 +63,7 @@ from homeassistant.components.assist_pipeline import (
     PipelineEventType,
     async_get_pipeline,
 )
+from homeassistant.components.assist_pipeline.error import SpeechToTextError
 from homeassistant.components.assist_satellite import (
     AssistSatelliteAnnouncement,
     AssistSatelliteEntity,
@@ -67,7 +73,7 @@ from homeassistant.components.media_player import async_process_play_media_url
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 
-from .const import ACTIVE_DEVICE_STATE, DEVICE_KEY
+from .const import ACTIVE_DEVICE_STATE, DEVICE_KEY, MUTED_CODE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -130,6 +136,8 @@ class Router:
         self._listened: dict[str, asyncio.Event] = {}
         # Device routes whose current run ends in a follow-up question: left alone.
         self._passthrough: set[str] = set()
+        # Devices whose voice mute switch is on: their spoken requests are dropped.
+        self.muted: set[str] = set()  # device registry IDs
 
     @property
     def has_device_routes(self) -> bool:
@@ -666,6 +674,10 @@ def install_pipeline(cls: type, get_router: Callable[[], Router | None]) -> None
         # their own pipelines (no satellite) are handled here.
         if router is not None and router.has_device_routes and _run_id(self, "satellite_id") is None:
             device_id = _run_id(self, "device_id")
+            if device_id and event.type is PipelineEventType.STT_START and device_id in router.muted:
+                # Muted: end the run before any audio reaches speech-to-text. Core turns
+                # this into the run's error event (the device shows the message).
+                raise SpeechToTextError(code=MUTED_CODE, message="Voice is muted on this device")
             if device_id:
                 try:
                     event = router.process_device(device_id, event)

@@ -234,3 +234,52 @@ async def test_router_error_never_breaks_the_run(hass: HomeAssistant, calls, tab
     run, seen = _run(hass, tablet)
     _send(run, *_conversation())
     assert len(seen) == len(_conversation())
+
+
+async def test_voice_mute_switch(hass: HomeAssistant, calls, tablet) -> None:
+    """The mute switch turns the app's wake word off and drops spoken requests."""
+    from homeassistant.components.assist_pipeline.error import SpeechToTextError
+    from homeassistant.core import ServiceCall
+
+    app = hass.config_entries.async_entries("mobile_app")[0]
+    hass.config_entries.async_update_entry(app, data={"device_name": "Office Tablet"})
+    sent: list[dict] = []
+
+    async def notify(call: ServiceCall) -> None:
+        sent.append(dict(call.data))
+
+    hass.services.async_register("notify", "mobile_app_office_tablet", notify)
+    await _setup(hass, _entry(tablet))
+    entity = "switch.office_tablet_voice_mute"
+    assert hass.states.get(entity).state == "off"
+
+    await hass.services.async_call("switch", "turn_on", {"entity_id": entity}, blocking=True)
+    assert hass.states.get(entity).state == "on"
+    assert sent == [{"message": "command_wake_word_detection", "data": {"command": "turn_off"}}]
+    run, seen = _run(hass, tablet)
+    _send(run, *_conversation()[:1])
+    with pytest.raises(SpeechToTextError) as err:
+        _send(run, *_conversation()[1:2])
+    assert err.value.code == "voice-muted"
+    # Nothing past run-start reached the app, and the speakers weren't ducked.
+    assert [e.type for e in seen] == [PipelineEventType.RUN_START]
+    assert calls == []
+
+    await hass.services.async_call("switch", "turn_off", {"entity_id": entity}, blocking=True)
+    assert sent[-1] == {"message": "command_wake_word_detection", "data": {"command": "turn_on"}}
+    run, seen = _run(hass, tablet)
+    _send(run, *_conversation()[:2])
+    assert PipelineEventType.STT_START in _by_type(seen)
+
+
+async def test_voice_mute_without_notify(hass: HomeAssistant, tablet) -> None:
+    """No notify action: the switch still mutes (requests dropped)."""
+    from homeassistant.components.assist_pipeline.error import SpeechToTextError
+
+    await _setup(hass, _entry(tablet))
+    await hass.services.async_call(
+        "switch", "turn_on", {"entity_id": "switch.office_tablet_voice_mute"}, blocking=True
+    )
+    run, _seen = _run(hass, tablet)
+    with pytest.raises(SpeechToTextError):
+        _send(run, *_conversation()[:2])

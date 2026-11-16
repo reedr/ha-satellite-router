@@ -9,6 +9,7 @@ from typing import Any
 
 from homeassistant.components.esphome import const as esphome_const
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 
@@ -19,10 +20,10 @@ from .const import (
     CONF_SATELLITE,
     CONF_STT_SCRIPT,
     CONF_TTS_SCRIPT,
+    DEVICE_KEY,
     DOMAIN,
     ISSUE_INCOMPATIBLE,
     ISSUE_PATCHED_CORE,
-    DEVICE_KEY,
     PLAYBACK_TIMEOUT,
     SUBENTRY_DEVICE,
     SUBENTRY_SATELLITE,
@@ -43,6 +44,8 @@ from .router import (
 _LOGGER = logging.getLogger(__name__)
 
 type RouterConfigEntry = ConfigEntry[Router | None]
+
+PLATFORMS = [Platform.SWITCH]  # voice mute switches of device routes
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> bool:
@@ -107,6 +110,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> bo
     else:
         install_pipeline(run_cls, lambda: _active_router(hass))
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
@@ -140,14 +144,22 @@ def _active_router(hass: HomeAssistant) -> Router | None:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: RouterConfigEntry) -> None:
-    """Subentries changed: rebuild the routes in place (no reload needed)."""
+    """Subentries changed: rebuild the routes in place (reload if devices came or went)."""
     if entry.runtime_data is not None:
-        entry.runtime_data.routes = routes_from(entry)
+        routes = routes_from(entry)
+        devices = {key for key in routes if key.startswith(DEVICE_KEY)}
+        if devices != {key for key in entry.runtime_data.routes if key.startswith(DEVICE_KEY)}:
+            # Their voice mute switches have to be added or removed.
+            hass.config_entries.async_schedule_reload(entry.entry_id)
+            return
+        entry.runtime_data.routes = routes
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: RouterConfigEntry) -> bool:
     """Restore ESPHome's own behaviour."""
     if entry.runtime_data is not None:
+        if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+            return False
         uninstall(satellite_class())
         uninstall_pipeline(pipeline_run_class())
     return True

@@ -62,6 +62,11 @@ device's requests, and only those:
 - While such a request is going on, the state `satellite_router.active_device` holds the device's area (state) and
   device ID / name (attributes), and is `idle` otherwise. Scripts can use it to know which room a request came from,
   for example to play music "here".
+- Each device gets a **Voice mute** switch on its own device page (e.g. `switch.office_tablet_voice_mute`). Turning
+  it on sends the Android app the `command_wake_word_detection` notification command to turn its wake word off
+  (this needs Home Assistant to be the device's default digital assistant app), and while it is on any spoken
+  request that still arrives is ended before speech-to-text, so its audio isn't transcribed and nothing runs.
+  Typed requests still work. Turning it off turns the wake word back on. The switch keeps its state across restarts.
 
 If a Home Assistant update changes the pipeline code this hooks into, a warning is logged and devices go back to
 playing responses themselves; satellites are unaffected.

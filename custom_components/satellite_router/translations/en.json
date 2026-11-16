@@ -116,5 +116,12 @@
       "title": "ESPHome is patched to route satellites",
       "description": "This Home Assistant's ESPHome integration has the satellite TTS/STT script options patched in. Satellite Router is inactive so responses aren't routed twice. Remove the patch (or this integration)."
     }
+  },
+  "entity": {
+    "switch": {
+      "voice_mute": {
+        "name": "Voice mute"
+      }
+    }
   }
 }

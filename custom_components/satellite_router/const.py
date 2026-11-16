@@ -16,6 +16,8 @@ CONF_ANNOUNCEMENTS = "announcements"  # also route assist_satellite.announce
 DEVICE_KEY = "device:"
 # While a routed device's run is going on, this state names the device and its area.
 ACTIVE_DEVICE_STATE = "satellite_router.active_device"
+# Error code of a muted device's spoken request.
+MUTED_CODE = "voice-muted"
 
 # How long a response or announcement may take to play on the media players.
 PLAYBACK_TIMEOUT = 300
